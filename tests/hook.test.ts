@@ -511,7 +511,7 @@ describe('model names', () => {
 
 describe('session.compact failures', () => {
   it('surfaces a network error with the url instead of failing silently', async () => {
-    const h = setup(90, undefined, {}, async () => {
+    const h = setup(90, undefined, { preserveRecentMessages: 1 }, async () => {
       throw new Error('ECONNRESET');
     });
     const next = vi.fn(async () => 'core');
