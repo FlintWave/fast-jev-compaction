@@ -328,12 +328,14 @@ async function checkOllamaModel(
   }
 }
 
-// Timers exist in the host runtime but not in the hooks tsconfig lib.
-declare function setTimeout(handler: () => void, ms?: number): unknown;
+const COMPACT_DELAY_MS = 250;
+const COMPACT_RETRY_MS = 1000;
+const COMPACT_RETRIES = 3;
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+  let scheduled = false;
   let setupChecked = false;
   let modelNumCtx = 0;
 
@@ -425,11 +427,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
     // Subagent turns reach every hook; only the main loop may trigger compaction.
     if (event.agentId) return next(event);
     const result = await next(event);
-    if (compacting) return result;
+    if (compacting || scheduled) return result;
+    scheduled = true;
 
-    // $.session.compact rejects while a turn runs, so start it after this hook returns.
-    const run = async (): Promise<void> => {
-      if (compacting) return;
+    // $.session.compact rejects while a turn runs, so start it after this hook
+    // returns, and retry a few times if the host has not yet finished the turn.
+    const run = async (attempt: number): Promise<void> => {
+      let retry = false;
       try {
         const { context } = await $.session.usage();
         if ((context.percent ?? 0) < configured.compactAtPercent) return;
@@ -437,15 +441,24 @@ export const register: Register = (on: On, options: PluginOptions) => {
         await $.session.compact();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (/turn is running|in flight/.test(message)) return;
-        $.ui.log(`auto-compact skipped (${message})`);
+        if (/turn is running|in flight/.test(message)) {
+          retry = attempt < COMPACT_RETRIES;
+        } else {
+          $.ui.log(`auto-compact skipped (${message})`);
+        }
       } finally {
         compacting = false;
+        if (!retry) scheduled = false;
+      }
+      if (retry) {
+        $.clock.after(COMPACT_RETRY_MS, () => {
+          void run(attempt + 1);
+        });
       }
     };
-    setTimeout(() => {
-      void run();
-    }, 0);
+    $.clock.after(COMPACT_DELAY_MS, () => {
+      void run(0);
+    });
     return result;
   });
 };
