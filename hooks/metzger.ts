@@ -482,8 +482,8 @@ const COMPACT_DELAY_MS = 250;
 const COMPACT_RETRY_MS = 1000;
 const COMPACT_RETRIES = 3;
 
-/** The slash command name; `status` first, falling back when the host refuses it. */
-const STATUS_COMMAND_NAMES = ['status', 'metzger-status'] as const;
+/** The plugin's file command `commands/status.md`, namespaced by the host as `/metzger:status`. */
+const STATUS_COMMAND = 'metzger:status';
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
@@ -491,25 +491,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let scheduled = false;
   let setupChecked = false;
   let modelNumCtx = 0;
-  let statusName: string | undefined;
   let lastCompaction: { at: number; text: string } | undefined;
   const record = (text: string): void => {
     lastCompaction = { at: Date.now(), text };
   };
 
   on('session.start', async ($, event, next) => {
-    // Always available, even when the setup checks below return early.
-    for (const name of STATUS_COMMAND_NAMES) {
-      try {
-        await $.command.register({
-          name,
-          description: 'Show Metzger settings, Ollama and model health, and the last compaction.',
-        });
-        statusName = name;
-        break;
-      } catch {}
-    }
-
     const result = await next(event);
 
     if (setupChecked) return result;
@@ -555,7 +542,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('command.run', async ($, event, next) => {
-    if (!statusName || event.command !== statusName) return next(event);
+    if (event.command !== STATUS_COMMAND) return next(event);
     const fetchFn = (url: string, init?: HookFetchInit, ms = NETWORK_TIMEOUT_MS): Promise<HookFetchResponse> =>
       withTimeout($.clock, ms, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
         status: r.status,

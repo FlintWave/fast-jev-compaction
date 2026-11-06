@@ -275,7 +275,6 @@ function setup(
     },
     ui: { log: vi.fn(), toast: vi.fn() },
     http: { fetch: vi.fn(fetchImpl) },
-    command: { register: vi.fn(async (spec: { name: string }) => ({ command: spec.name })) },
   };
   /** Fires the recorded timers (and any they schedule) in order, letting async work settle. */
   const flush = async (): Promise<void> => {
@@ -441,27 +440,30 @@ function ollama(models: string[], probe: FakeResponse | (() => FakeResponse)) {
 
 const runStatus = async (h: ReturnType<typeof setup>): Promise<string> => {
   await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
-  const out = await h.hooks.get('command.run')!(h.$, { command: 'status', args: '' }, async () => ({ text: 'builtin' }));
+  const out = await h.hooks.get('command.run')!(h.$, { command: 'metzger:status', args: '' }, async () => ({ text: 'file command' }));
   return out.text as string;
 };
 
 describe('status command', () => {
-  it('is registered even when baseUrl is not local', async () => {
-    const h = setup(90, undefined, { baseUrl: 'https://example.com/v1/systemone' });
-    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
-    expect(h.$.command.register).toHaveBeenCalledWith(expect.objectContaining({ name: 'status' }));
-  });
-
-  it('falls back to metzger-status when the host refuses the name, and ignores other commands', async () => {
-    const h = setup(90, undefined, { baseUrl: 'https://example.com/v1/systemone' });
-    h.$.command.register.mockImplementationOnce(async () => {
-      throw new Error('built-in');
+  it('answers metzger:status even when baseUrl is not local, without calling next', async () => {
+    const h = setup(90, undefined, { baseUrl: 'https://example.com/v1/systemone' }, async () => {
+      throw new Error('offline');
     });
     await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
-    expect(h.$.command.register).toHaveBeenLastCalledWith(expect.objectContaining({ name: 'metzger-status' }));
-    const next = vi.fn(async () => ({ text: 'builtin' }));
-    await h.hooks.get('command.run')!(h.$, { command: 'status', args: '' }, next);
-    expect(next).toHaveBeenCalledTimes(1);
+    const next = vi.fn(async () => ({ text: 'file command' }));
+    const out = await h.hooks.get('command.run')!(h.$, { command: 'metzger:status', args: '' }, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(out.text).toContain('metzger 0.6.0');
+  });
+
+  it('passes other commands (including a bare status) through to next', async () => {
+    const h = setup();
+    for (const command of ['status', 'compact', 'metzger:other']) {
+      const next = vi.fn(async () => ({ text: 'core' }));
+      const out = await h.hooks.get('command.run')!(h.$, { command, args: '' }, next);
+      expect(out).toEqual({ text: 'core' });
+      expect(next).toHaveBeenCalledTimes(1);
+    }
   });
 
   it('reports a reachability failure when fetch rejects', async () => {
