@@ -114,7 +114,7 @@ export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string, base
         headers: request.headers,
         body: request.body,
       });
-      return parseJevResponse(response.status, response.ok, response.text);
+      return parseJevResponse(response.status, response.ok, response.text, request.url);
     },
   };
 }
@@ -279,6 +279,46 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+/** Keep in sync with .claude-plugin/plugin.json. */
+export const METZGER_VERSION = '0.6.0';
+
+const NETWORK_TIMEOUT_MS = 10_000;
+const COMPACT_REQUEST_TIMEOUT_MS = 120_000;
+const PROBE_TIMEOUT_MS = 60_000;
+
+type Clock = { after: (ms: number, fn: () => void) => { cancel: () => void } };
+
+/** Rejects when `promise` has not settled after `ms`, using the host clock. */
+export function withTimeout<T>(clock: Clock, ms: number, label: string, promise: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = clock.after(ms, () => reject(new Error(`${label} timed out after ${ms} ms`)));
+    promise.then(
+      (value) => {
+        timer.cancel();
+        resolve(value);
+      },
+      (error: unknown) => {
+        timer.cancel();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The pulled-model name that stands in for `model`, or undefined. Exact name or `:latest` only. */
+function findPulled(names: readonly string[], model: string): string | undefined {
+  return names.find((n) => n === model || n === `${model}:latest`);
+}
+
+/** The one legacy rename: `metzger:0.8b` <-> `kaineone/metzger:0.8b`. */
+export function legacyAlias(model: string): string {
+  return model.startsWith('kaineone/') ? model.slice('kaineone/'.length) : `kaineone/${model}`;
+}
+
 function parseNumCtx(showResp: HookFetchResponse): number {
   if (!showResp.ok) return 0;
   try {
@@ -299,32 +339,142 @@ function parseNumCtx(showResp: HookFetchResponse): number {
   return 0;
 }
 
+function parseCapabilities(showResp: HookFetchResponse): string[] | undefined {
+  if (!showResp.ok) return undefined;
+  try {
+    const data = JSON.parse(showResp.text) as { capabilities?: unknown };
+    if (Array.isArray(data.capabilities)) return data.capabilities.map(String);
+  } catch {}
+  return undefined;
+}
+
+export type OllamaModelCheck = {
+  ollamaUp: boolean;
+  modelPulled: boolean;
+  numCtx: number;
+  /** The pulled name to use: `model`, or its legacy alias when only that is pulled. */
+  model: string;
+  renamed: boolean;
+  capabilities?: string[];
+};
+
 async function checkOllamaModel(
   fetchFn: HookFetch,
   baseUrl: string,
   model: string,
-): Promise<{ ollamaUp: boolean; modelPulled: boolean; numCtx: number }> {
-  const ollamaBase = baseUrl.replace(/\/v1\/systemone\/?$/, '');
+): Promise<OllamaModelCheck> {
+  const ollamaBase = ollamaBaseUrl(baseUrl);
+  const down: OllamaModelCheck = { ollamaUp: false, modelPulled: false, numCtx: 0, model, renamed: false };
   try {
     const resp = await fetchFn(`${ollamaBase}/api/tags`);
-    if (!resp.ok) return { ollamaUp: false, modelPulled: false, numCtx: 0 };
+    if (!resp.ok) return down;
     const data = JSON.parse(resp.text) as { models?: { name?: string }[] };
     const names = (data.models ?? []).map((m) => m.name ?? '');
-    const pulled = names.some(
-      (n) => n === model || n === `${model}:latest` || n.startsWith(`${model}:`) || model.includes(':') && n === model.replace(/:/, ':'),
-    );
-    let numCtx = 0;
-    if (pulled) {
-      const showResp = await fetchFn(`${ollamaBase}/api/show`, {
+    let resolved = findPulled(names, model);
+    let renamed = false;
+    if (!resolved) {
+      resolved = findPulled(names, legacyAlias(model));
+      renamed = resolved !== undefined;
+    }
+    if (!resolved) return { ...down, ollamaUp: true };
+    const showResp = await fetchFn(`${ollamaBase}/api/show`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: resolved }),
+    });
+    const capabilities = parseCapabilities(showResp);
+    return {
+      ollamaUp: true,
+      modelPulled: true,
+      numCtx: parseNumCtx(showResp),
+      model: renamed ? legacyAlias(model) : model,
+      renamed,
+      ...(capabilities ? { capabilities } : {}),
+    };
+  } catch {
+    return down;
+  }
+}
+
+function ollamaBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/v1\/systemone\/?$/, '');
+}
+
+/** The token budgets the next compaction runs with: the backend clamp, then the model's context. */
+export function effectiveConfig(configured: HookConfig, modelNumCtx: number): HookConfig {
+  const config = { ...configured };
+  if (resolveBackend(config) === 'systemone') {
+    config.maxRequestTokens = Math.min(config.maxRequestTokens ?? 30_000, SYSTEMONE_MAX_REQUEST_TOKENS);
+    config.maxStateTokens = Math.min(config.maxStateTokens ?? 25_000, SYSTEMONE_MAX_STATE_TOKENS);
+  }
+  if (modelNumCtx > 0) {
+    const maxReq = Math.floor(modelNumCtx * 0.9);
+    config.maxRequestTokens = Math.min(config.maxRequestTokens ?? 30_000, maxReq);
+    config.maxStateTokens = Math.min(config.maxStateTokens ?? 25_000, maxReq - 500);
+  }
+  return config;
+}
+
+/** One live Jev call, reported as a single line. Never throws. */
+export async function probeLine(
+  fetchFn: HookFetch,
+  config: HookConfig,
+): Promise<string> {
+  const backend = resolveBackend(config);
+  const started = Date.now();
+  const elapsed = (): string => `${Date.now() - started} ms`;
+  try {
+    if (backend === 'chat') {
+      const url = `${chatBaseUrl(config.baseUrl)}/api/chat`;
+      const response = await fetchFn(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name: model }),
+        body: JSON.stringify({
+          model: config.model,
+          messages: [{ role: 'user', content: 'Reply with the letter A.' }],
+          stream: false,
+          options: { temperature: 0 },
+          think: false,
+        }),
       });
-      numCtx = parseNumCtx(showResp);
+      if (!response.ok) return `chat probe: HTTP ${response.status} in ${elapsed()}: ${response.text.slice(0, 200)}`;
+      if (response.text.trim() === '') return `chat probe: empty response from ${url} (HTTP ${response.status}, ${elapsed()})`;
+      let content: unknown;
+      try {
+        content = (JSON.parse(response.text) as { message?: { content?: unknown } }).message?.content;
+      } catch {
+        return `chat probe: malformed JSON in ${elapsed()}: ${response.text.slice(0, 200)}`;
+      }
+      if (typeof content !== 'string' || content.trim() === '') {
+        return `chat probe: empty response from ${url} (HTTP ${response.status}, ${elapsed()})`;
+      }
+      return `chat probe: HTTP ${response.status} in ${elapsed()}, model answered "${content.trim().slice(0, 40)}"`;
     }
-    return { ollamaUp: true, modelPulled: pulled, numCtx };
-  } catch {
-    return { ollamaUp: false, modelPulled: false, numCtx: 0 };
+    const response = await fetchFn(config.baseUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: config.model,
+        state: { history: [{ role: 'user', text: 'ping' }] },
+        questions: { q1: { type: 'noul', instructions: 'Is this message still needed?' } },
+      }),
+    });
+    const prefix = `probe: HTTP ${response.status} in ${elapsed()}`;
+    if (!response.ok) return `${prefix}, error: ${response.text.slice(0, 200)}`;
+    if (response.text.trim() === '') return `${prefix}, empty response`;
+    let parsed: { answers?: Record<string, { noul?: unknown }> };
+    try {
+      parsed = JSON.parse(response.text);
+    } catch {
+      return `${prefix}, malformed JSON: ${response.text.slice(0, 200)}`;
+    }
+    const noul = parsed.answers?.q1?.noul;
+    if (typeof noul !== 'number' || !Number.isFinite(noul)) {
+      return `${prefix}, invalid answer: ${response.text.slice(0, 200)}`;
+    }
+    return `${prefix}, noul=${noul}`;
+  } catch (error) {
+    return `probe: failed after ${elapsed()}: ${errorMessage(error)}`;
   }
 }
 
@@ -332,14 +482,34 @@ const COMPACT_DELAY_MS = 250;
 const COMPACT_RETRY_MS = 1000;
 const COMPACT_RETRIES = 3;
 
+/** The slash command name; `status` first, falling back when the host refuses it. */
+const STATUS_COMMAND_NAMES = ['status', 'metzger-status'] as const;
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
   let scheduled = false;
   let setupChecked = false;
   let modelNumCtx = 0;
+  let statusName: string | undefined;
+  let lastCompaction: { at: number; text: string } | undefined;
+  const record = (text: string): void => {
+    lastCompaction = { at: Date.now(), text };
+  };
 
   on('session.start', async ($, event, next) => {
+    // Always available, even when the setup checks below return early.
+    for (const name of STATUS_COMMAND_NAMES) {
+      try {
+        await $.command.register({
+          name,
+          description: 'Show Metzger settings, Ollama and model health, and the last compaction.',
+        });
+        statusName = name;
+        break;
+      } catch {}
+    }
+
     const result = await next(event);
 
     if (setupChecked) return result;
@@ -348,17 +518,19 @@ export const register: Register = (on: On, options: PluginOptions) => {
     const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(configured.baseUrl);
     if (!isLocal) return result;
 
-    const { ollamaUp, modelPulled, numCtx } = await checkOllamaModel(
-      async (url, init) => {
-        const r = await $.http.fetch(url, init);
-        return { status: r.status, ok: r.ok, text: r.text };
-      },
+    const check = await checkOllamaModel(
+      (url, init) =>
+        withTimeout($.clock, NETWORK_TIMEOUT_MS, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
+          status: r.status,
+          ok: r.ok,
+          text: r.text,
+        })),
       configured.baseUrl,
       configured.model,
     );
-    modelNumCtx = numCtx;
+    modelNumCtx = check.numCtx;
 
-    if (!ollamaUp) {
+    if (!check.ollamaUp) {
       $.ui.toast(
         'metzger: Ollama is not running. Install it from https://ollama.com then run: ollama pull kaineone/metzger:0.8b',
         { timeoutMs: 30_000 },
@@ -366,59 +538,136 @@ export const register: Register = (on: On, options: PluginOptions) => {
       return result;
     }
 
-    if (!modelPulled) {
+    if (!check.modelPulled) {
       $.ui.toast(
-        `metzger: decision model "${configured.model}" not found. Run: ollama pull kaineone/${configured.model}`,
+        `metzger: decision model "${configured.model}" not found. Run: ollama pull ${configured.model}`,
         { timeoutMs: 30_000 },
       );
       return result;
     }
 
+    if (check.renamed) {
+      $.ui.toast(`metzger: using ${check.model}; update the model option`, { timeoutMs: 15_000 });
+      configured.model = check.model;
+    }
+
     return result;
+  });
+
+  on('command.run', async ($, event, next) => {
+    if (!statusName || event.command !== statusName) return next(event);
+    const fetchFn = (url: string, init?: HookFetchInit, ms = NETWORK_TIMEOUT_MS): Promise<HookFetchResponse> =>
+      withTimeout($.clock, ms, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
+        status: r.status,
+        ok: r.ok,
+        text: r.text,
+      }));
+    const backend = resolveBackend(configured);
+    const lines = [
+      `metzger ${METZGER_VERSION}`,
+      `backend: ${backend}`,
+      `model: ${configured.model}`,
+      `baseUrl: ${configured.baseUrl}`,
+    ];
+
+    const base = ollamaBaseUrl(configured.baseUrl);
+    let reachable = false;
+    try {
+      const response = await fetchFn(`${base}/api/version`);
+      if (!response.ok) {
+        lines.push(`ollama: not reachable: HTTP ${response.status} from ${base}/api/version`);
+      } else {
+        reachable = true;
+        let version = response.text.trim().slice(0, 40);
+        try {
+          const parsed = JSON.parse(response.text) as { version?: unknown };
+          if (typeof parsed.version === 'string') version = parsed.version;
+        } catch {}
+        lines.push(`ollama: reachable at ${base} (version ${version || 'unknown'})`);
+      }
+    } catch (error) {
+      lines.push(`ollama: not reachable: ${errorMessage(error)}`);
+    }
+
+    let numCtx = modelNumCtx;
+    if (reachable) {
+      const check = await checkOllamaModel(fetchFn, configured.baseUrl, configured.model);
+      if (!check.modelPulled) {
+        lines.push(`model: not pulled (run: ollama pull ${configured.model})`);
+      } else {
+        numCtx = check.numCtx || numCtx;
+        const note = check.renamed ? ` (pulled as ${check.model}; update the model option)` : '';
+        lines.push(`model: pulled${note}, num_ctx ${check.numCtx || 'unknown'}`);
+        if (!check.capabilities) {
+          lines.push('capabilities: not reported by Ollama');
+        } else {
+          lines.push(`capabilities: ${check.capabilities.join(', ') || '(none)'}`);
+          if (!check.capabilities.includes('decision')) {
+            lines.push(
+              'WARNING: the model lacks the "decision" capability, which /v1/systemone needs. Pull kaineone/metzger:0.8b.',
+            );
+          }
+        }
+      }
+      lines.push(await probeLine((url, init) => fetchFn(url, init, PROBE_TIMEOUT_MS), configured));
+    } else {
+      lines.push('model and probe: skipped (Ollama not reachable)');
+    }
+
+    const effective = effectiveConfig(configured, numCtx);
+    lines.push(
+      `budgets: state ${effective.maxStateTokens ?? 25_000} tokens, request ${effective.maxRequestTokens ?? 30_000} tokens`,
+    );
+    let context = 'unknown';
+    try {
+      const usage = await $.session.usage();
+      if (usage.context.percent !== undefined && usage.context.percent !== null) {
+        context = `${Math.round(usage.context.percent)}%`;
+      }
+    } catch {}
+    lines.push(`context: ${context} (auto-compact at ${configured.compactAtPercent}%)`);
+    lines.push(
+      lastCompaction
+        ? `last compaction: ${new Date(lastCompaction.at).toISOString()} ${lastCompaction.text}`
+        : 'last compaction: none yet this session',
+    );
+    return { text: lines.join('\n') };
   });
 
   on('session.compact', async ($, event, next) => {
     // A subagent's or fork's own transcript: leave it to core.
     if (event.agentId) return next(event);
     try {
-      const config = { ...configured };
-      if (resolveBackend(config) === 'systemone') {
-        config.maxRequestTokens = Math.min(
-          config.maxRequestTokens ?? 30_000,
-          SYSTEMONE_MAX_REQUEST_TOKENS,
-        );
-        config.maxStateTokens = Math.min(
-          config.maxStateTokens ?? 25_000,
-          SYSTEMONE_MAX_STATE_TOKENS,
-        );
-      }
-      if (modelNumCtx > 0) {
-        const maxReq = Math.floor(modelNumCtx * 0.9);
-        config.maxRequestTokens = Math.min(config.maxRequestTokens ?? 30_000, maxReq);
-        config.maxStateTokens = Math.min(config.maxStateTokens ?? 25_000, maxReq - 500);
-      }
+      const config = effectiveConfig(configured, modelNumCtx);
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
+        let response;
+        try {
+          response = await withTimeout(
+            $.clock,
+            COMPACT_REQUEST_TIMEOUT_MS,
+            `request to ${url}`,
+            $.http.fetch(url, init),
+          );
+        } catch (error) {
+          throw new Error(`request to ${url} failed: ${errorMessage(error)}`);
+        }
         return { status: response.status, ok: response.ok, text: response.text };
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
-          $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
-        );
+        const text = `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`;
+        record(text);
+        notify($, text);
         return next(event);
       }
-      notify(
-        $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
-      );
+      const text = `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`;
+      record(text);
+      notify($, text);
       return { messages };
     } catch (error) {
-      notify(
-        $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
-      );
+      const text = `fallback to built-in summary (${errorMessage(error)})`;
+      record(text);
+      notify($, text);
       return next(event);
     }
   });
@@ -440,10 +689,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
         compacting = true;
         await $.session.compact();
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorMessage(error);
         if (/turn is running|in flight/.test(message)) {
           retry = attempt < COMPACT_RETRIES;
+          if (!retry) record(`auto-compact gave up: a turn was still running after ${COMPACT_RETRIES} retries`);
         } else {
+          record(`auto-compact skipped (${message})`);
           $.ui.log(`auto-compact skipped (${message})`);
         }
       } finally {

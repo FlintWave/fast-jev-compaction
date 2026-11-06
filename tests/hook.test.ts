@@ -240,13 +240,22 @@ describe('ChatJevAsker', () => {
 
 type AnyHook = (...args: any[]) => Promise<any>;
 
-function setup(usagePercent = 90, compactImpl: (call: number) => Promise<unknown> = async () => undefined) {
+type FakeResponse = { status: number; ok: boolean; text: string };
+
+function setup(
+  usagePercent = 90,
+  compactImpl: (call: number) => Promise<unknown> = async () => undefined,
+  options: Record<string, string | number> = {},
+  fetchImpl: (url: string, init?: { method?: string; body?: string }) => Promise<FakeResponse> = async () => {
+    throw new Error('no network');
+  },
+) {
   const hooks = new Map<string, AnyHook>();
   const on = ((pattern: string, hook: AnyHook) => {
     hooks.set(pattern, hook);
     return { dispose() {} };
   }) as never;
-  register(on, {});
+  register(on, options);
   const order: string[] = [];
   const timers: { ms: number; fn: () => void }[] = [];
   let compactCalls = 0;
@@ -265,7 +274,8 @@ function setup(usagePercent = 90, compactImpl: (call: number) => Promise<unknown
       }),
     },
     ui: { log: vi.fn(), toast: vi.fn() },
-    http: { fetch: vi.fn() },
+    http: { fetch: vi.fn(fetchImpl) },
+    command: { register: vi.fn(async (spec: { name: string }) => ({ command: spec.name })) },
   };
   /** Fires the recorded timers (and any they schedule) in order, letting async work settle. */
   const flush = async (): Promise<void> => {
@@ -413,5 +423,101 @@ describe('systemone budgets', () => {
     console.log(`systemone max body bytes: ${Math.max(...sizes)} over ${sizes.length} request(s)`);
     expect(sizes.length).toBeGreaterThan(0);
     expect(Math.max(...sizes)).toBeLessThanOrEqual(SYSTEMONE_MAX_BODY_BYTES);
+  });
+});
+
+const ok = (text: string): FakeResponse => ({ status: 200, ok: true, text });
+
+/** An Ollama that serves `models`, with `probe` answering the systemone POST. */
+function ollama(models: string[], probe: FakeResponse | (() => FakeResponse)) {
+  return async (url: string, init?: { method?: string }): Promise<FakeResponse> => {
+    if (url.endsWith('/api/version')) return ok('{"version":"0.9.1"}');
+    if (url.endsWith('/api/tags')) return ok(JSON.stringify({ models: models.map((name) => ({ name })) }));
+    if (url.endsWith('/api/show')) return ok(JSON.stringify({ capabilities: ['decision'], parameters: 'num_ctx 32768' }));
+    if (init?.method === 'POST') return typeof probe === 'function' ? probe() : probe;
+    throw new Error(`unexpected ${url}`);
+  };
+}
+
+const runStatus = async (h: ReturnType<typeof setup>): Promise<string> => {
+  await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+  const out = await h.hooks.get('command.run')!(h.$, { command: 'status', args: '' }, async () => ({ text: 'builtin' }));
+  return out.text as string;
+};
+
+describe('status command', () => {
+  it('is registered even when baseUrl is not local', async () => {
+    const h = setup(90, undefined, { baseUrl: 'https://example.com/v1/systemone' });
+    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    expect(h.$.command.register).toHaveBeenCalledWith(expect.objectContaining({ name: 'status' }));
+  });
+
+  it('falls back to metzger-status when the host refuses the name, and ignores other commands', async () => {
+    const h = setup(90, undefined, { baseUrl: 'https://example.com/v1/systemone' });
+    h.$.command.register.mockImplementationOnce(async () => {
+      throw new Error('built-in');
+    });
+    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    expect(h.$.command.register).toHaveBeenLastCalledWith(expect.objectContaining({ name: 'metzger-status' }));
+    const next = vi.fn(async () => ({ text: 'builtin' }));
+    await h.hooks.get('command.run')!(h.$, { command: 'status', args: '' }, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a reachability failure when fetch rejects', async () => {
+    const h = setup(90, undefined, {}, async () => {
+      throw new Error('ECONNREFUSED');
+    });
+    const text = await runStatus(h);
+    expect(text).toContain('ollama: not reachable: ECONNREFUSED');
+    expect(text).toContain('last compaction: none yet this session');
+    expect(text).toContain('budgets: state 15000');
+  });
+
+  it('reports an empty 200 probe body explicitly', async () => {
+    const h = setup(90, undefined, {}, ollama(['kaineone/metzger:0.8b'], ok('')));
+    const text = await runStatus(h);
+    expect(text).toContain('probe: HTTP 200');
+    expect(text).toContain('empty response');
+    expect(text).toContain('capabilities: decision');
+    expect(text).toContain('version 0.9.1');
+    expect(text).toContain('budgets: state 15000 tokens, request 18000 tokens');
+  });
+
+  it('reports the noul value and flags an invalid answer', async () => {
+    const good = setup(90, undefined, {}, ollama(['kaineone/metzger:0.8b'], ok('{"answers":{"q1":{"type":"noul","noul":0.25}}}')));
+    expect(await runStatus(good)).toContain('noul=0.25');
+    const bad = setup(90, undefined, {}, ollama(['kaineone/metzger:0.8b'], ok('{"answers":{"q1":{"type":"noul","noul":null}}}')));
+    expect(await runStatus(bad)).toContain('invalid answer');
+  });
+});
+
+describe('model names', () => {
+  it('uses kaineone/metzger:0.8b when only that is pulled and the legacy name is configured', async () => {
+    const h = setup(90, undefined, { model: 'metzger:0.8b' }, ollama(['kaineone/metzger:0.8b'], ok('{}')));
+    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    expect(h.$.ui.toast).toHaveBeenCalledTimes(1);
+    expect(h.$.ui.toast.mock.calls[0]![0]).toBe('metzger: using kaineone/metzger:0.8b; update the model option');
+  });
+
+  it('prints the pull command with a single prefix when the model is missing', async () => {
+    const h = setup(90, undefined, {}, ollama([], ok('{}')));
+    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    const text = h.$.ui.toast.mock.calls[0]![0] as string;
+    expect(text).toContain('ollama pull kaineone/metzger:0.8b');
+    expect(text).not.toContain('kaineone/kaineone');
+  });
+});
+
+describe('session.compact failures', () => {
+  it('surfaces a network error with the url instead of failing silently', async () => {
+    const h = setup(90, undefined, {}, async () => {
+      throw new Error('ECONNRESET');
+    });
+    const next = vi.fn(async () => 'core');
+    const out = await h.hooks.get('session.compact')!(h.$, { messages: transcript() }, next);
+    expect(out).toBe('core');
+    const text = h.$.ui.toast.mock.calls[0]![0] as string;
+    expect(text).toMatch(/fallback to built-in summary \(request to http:\/\/localhost:11434\/v1\/systemone failed: ECONNRESET\)/);
   });
 });

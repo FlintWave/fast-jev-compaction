@@ -152,6 +152,10 @@ Set these in `~/.claude/settings.json` under `pluginConfigs.metzger`:
 | `baseUrl` | `http://localhost:11434/v1/systemone` | Ollama System One endpoint |
 | `backend` | `auto` | `systemone` for the System One protocol, `chat` for the Ollama chat API (distilled models), `auto` to detect |
 
+## Commands
+
+`/status` shows whether Metzger is working. It reports the version, backend, model and endpoint; whether Ollama is reachable; whether the model is pulled, its context size and its capabilities (the model needs `decision`); a live test request with its timing and answer; the token budgets the next compaction will use; the current context fill; and the outcome of the last compaction. If the host refuses the name `status`, the command is `/metzger-status`.
+
 ## npm library
 
 Metzger is also an npm package if you want to use the compaction logic in your

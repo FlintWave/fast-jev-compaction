@@ -403,6 +403,7 @@ describe('HTTP request building', () => {
 
   it('rejects failed and malformed responses', () => {
     expect(() => parseJevResponse(500, false, 'boom')).toThrow(/500/);
+    expect(() => parseJevResponse(200, true, '', 'http://x/v1')).toThrow(/empty response from http:\/\/x\/v1/);
     expect(() => parseJevResponse(200, true, 'not json')).toThrow(/malformed/);
     expect(() => parseJevResponse(200, true, '{}')).toThrow(/missing answers/);
     expect(parseJevResponse(200, true, '{"answers":{}}')).toEqual({ answers: {} });
