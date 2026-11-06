@@ -286,12 +286,12 @@ const NETWORK_TIMEOUT_MS = 10_000;
 const COMPACT_REQUEST_TIMEOUT_MS = 120_000;
 const PROBE_TIMEOUT_MS = 60_000;
 
-type Clock = { after: (ms: number, fn: () => void) => { cancel: () => void } };
+type Scheduler = (ms: number, fn: () => void) => { cancel: () => void };
 
 /** Rejects when `promise` has not settled after `ms`, using the host clock. */
-export function withTimeout<T>(clock: Clock, ms: number, label: string, promise: Promise<T>): Promise<T> {
+export function withTimeout<T>(schedule: Scheduler, ms: number, label: string, promise: Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = clock.after(ms, () => reject(new Error(`${label} timed out after ${ms} ms`)));
+    const timer = schedule(ms, () => reject(new Error(`${label} timed out after ${ms} ms`)));
     promise.then(
       (value) => {
         timer.cancel();
@@ -507,7 +507,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
     const check = await checkOllamaModel(
       (url, init) =>
-        withTimeout($.clock, NETWORK_TIMEOUT_MS, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
+        withTimeout((ms, fn) => $.clock.after(ms, fn), NETWORK_TIMEOUT_MS, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
           status: r.status,
           ok: r.ok,
           text: r.text,
@@ -544,7 +544,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('command.run', async ($, event, next) => {
     if (event.command !== STATUS_COMMAND) return next(event);
     const fetchFn = (url: string, init?: HookFetchInit, ms = NETWORK_TIMEOUT_MS): Promise<HookFetchResponse> =>
-      withTimeout($.clock, ms, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
+      withTimeout((ms, fn) => $.clock.after(ms, fn), ms, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
         status: r.status,
         ok: r.ok,
         text: r.text,
@@ -630,7 +630,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         let response;
         try {
           response = await withTimeout(
-            $.clock,
+            (ms, fn) => $.clock.after(ms, fn),
             COMPACT_REQUEST_TIMEOUT_MS,
             `request to ${url}`,
             $.http.fetch(url, init),
