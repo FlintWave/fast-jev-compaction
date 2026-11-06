@@ -37,9 +37,13 @@ export function parseJevResponse(
   status: number,
   ok: boolean,
   text: string,
+  url?: string,
 ): JevResponse {
   if (!ok) {
     throw new Error(`Jev request failed (${status}): ${text.slice(0, 200)}`);
+  }
+  if (text.trim() === '') {
+    throw new Error(`empty response from ${url ?? 'the endpoint'}`);
   }
   let parsed: unknown;
   try {
