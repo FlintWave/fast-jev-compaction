@@ -95,8 +95,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
 /** The local `/v1/systemone` endpoint rejects bodies (text + schema) over 64 KiB; stay under with margin. */
 export const SYSTEMONE_MAX_BODY_BYTES = 60 * 1024;
 /** Conservative token budgets for the systemone backend so a request fits in SYSTEMONE_MAX_BODY_BYTES. */
-export const SYSTEMONE_MAX_REQUEST_TOKENS = 12_000;
-export const SYSTEMONE_MAX_STATE_TOKENS = 9_000;
+export const SYSTEMONE_MAX_REQUEST_TOKENS = 18_000;
+export const SYSTEMONE_MAX_STATE_TOKENS = 15_000;
 
 /** A `JevAsker` over the engine's `$.http.fetch`. */
 export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string, baseUrl?: string): JevAsker {

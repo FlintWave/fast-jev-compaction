@@ -389,7 +389,7 @@ describe('systemone request size cap', () => {
 describe('systemone budgets', () => {
   it('keep every request body under the endpoint limit on a large non-ASCII transcript', async () => {
     const messages: SessionMessage[] = [message('user', 'Refactor the é漢字 module.', { handle: 'h-0' })];
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 150; i++) {
       const blob = { rows: Array.from({ length: 40 }, (_, k) => ({ k, name: `é漢字-${i}-${k}`, ok: k % 2 === 0 })) };
       const text = `${JSON.stringify(blob)} ${'é漢字'.repeat(600)}`;
       messages.push(call(`c${i}`, 'Bash', { command: `echo ${'é漢字'.repeat(40)}`, payload: blob }, text));
