@@ -1,8 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  jevAsker,
+  register,
+  SYSTEMONE_MAX_BODY_BYTES,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -230,5 +233,124 @@ describe('ChatJevAsker', () => {
     });
 
     expect(response.answers.q).toEqual({ type: 'noul', noul: 1.0 });
+  });
+});
+
+type AnyHook = (...args: any[]) => Promise<any>;
+
+function setup(usagePercent = 90, compactImpl: () => Promise<unknown> = async () => undefined) {
+  const hooks = new Map<string, AnyHook>();
+  const on = ((pattern: string, hook: AnyHook) => {
+    hooks.set(pattern, hook);
+    return { dispose() {} };
+  }) as never;
+  register(on, {});
+  const order: string[] = [];
+  const $ = {
+    session: {
+      usage: vi.fn(async () => ({ context: { percent: usagePercent } })),
+      compact: vi.fn(async () => {
+        order.push('compact');
+        return compactImpl();
+      }),
+    },
+    ui: { log: vi.fn(), toast: vi.fn() },
+    http: { fetch: vi.fn() },
+  };
+  return { hooks, $, order };
+}
+
+describe('turn.complete auto-compact', () => {
+  it('skips subagent turns entirely', async () => {
+    vi.useFakeTimers();
+    try {
+      const { hooks, $ } = setup();
+      const next = vi.fn(async () => 'r');
+      const out = await hooks.get('turn.complete')!($, { agentId: 'sub-1' }, next);
+      await vi.runAllTimersAsync();
+      expect(out).toBe('r');
+      expect(next).toHaveBeenCalledTimes(1);
+      expect($.session.usage).not.toHaveBeenCalled();
+      expect($.session.compact).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('calls next first and compacts asynchronously after the hook returns', async () => {
+    vi.useFakeTimers();
+    try {
+      const { hooks, $, order } = setup();
+      const next = vi.fn(async () => {
+        order.push('next');
+        return 'r';
+      });
+      const out = await hooks.get('turn.complete')!($, {}, next);
+      expect(out).toBe('r');
+      expect($.session.compact).not.toHaveBeenCalled();
+      await vi.runAllTimersAsync();
+      expect($.session.compact).toHaveBeenCalledTimes(1);
+      expect(order).toEqual(['next', 'compact']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stays silent when the turn is still running, logs other errors', async () => {
+    vi.useFakeTimers();
+    try {
+      const busy = setup(90, async () => {
+        throw new Error('metzger: $.session.compact: a turn is in flight');
+      });
+      await busy.hooks.get('turn.complete')!(busy.$, {}, async () => 'r');
+      await vi.runAllTimersAsync();
+      expect(busy.$.ui.log).not.toHaveBeenCalled();
+
+      const bad = setup(90, async () => {
+        throw new Error('boom');
+      });
+      await bad.hooks.get('turn.complete')!(bad.$, {}, async () => 'r');
+      await vi.runAllTimersAsync();
+      expect(bad.$.ui.log).toHaveBeenCalledWith('auto-compact skipped (boom)');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not compact below the threshold', async () => {
+    vi.useFakeTimers();
+    try {
+      const { hooks, $ } = setup(10);
+      await hooks.get('turn.complete')!($, {}, async () => 'r');
+      await vi.runAllTimersAsync();
+      expect($.session.compact).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('session.compact', () => {
+  it('passes subagent and fork compactions through untouched', async () => {
+    const { hooks, $ } = setup();
+    const next = vi.fn(async () => 'core');
+    const event = { agentId: 'sub-1', messages: transcript() };
+    const out = await hooks.get('session.compact')!($, event, next);
+    expect(out).toBe('core');
+    expect(next).toHaveBeenCalledWith(event);
+    expect($.http.fetch).not.toHaveBeenCalled();
+    expect($.ui.log).not.toHaveBeenCalled();
+  });
+});
+
+describe('systemone request size cap', () => {
+  it('throws a clear error instead of sending an oversized body', async () => {
+    const fetchFn = vi.fn(async () => ({ status: 200, ok: true, text: '{}' }));
+    const asker = jevAsker(fetchFn, 'local', 'kaineone/metzger:0.8b');
+    const huge = 'x'.repeat(SYSTEMONE_MAX_BODY_BYTES + 10);
+    await expect(
+      asker.ask(huge, { q: { type: 'noul', instructions: 'Keep?' } }),
+    ).rejects.toThrow(/request too large for local endpoint \(\d+ bytes > \d+ limit\)/);
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 });
