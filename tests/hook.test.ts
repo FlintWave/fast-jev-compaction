@@ -1,8 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  jevAsker,
+  register,
+  SYSTEMONE_MAX_BODY_BYTES,
+  SYSTEMONE_MAX_REQUEST_TOKENS,
+  SYSTEMONE_MAX_STATE_TOKENS,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -230,5 +235,183 @@ describe('ChatJevAsker', () => {
     });
 
     expect(response.answers.q).toEqual({ type: 'noul', noul: 1.0 });
+  });
+});
+
+type AnyHook = (...args: any[]) => Promise<any>;
+
+function setup(usagePercent = 90, compactImpl: (call: number) => Promise<unknown> = async () => undefined) {
+  const hooks = new Map<string, AnyHook>();
+  const on = ((pattern: string, hook: AnyHook) => {
+    hooks.set(pattern, hook);
+    return { dispose() {} };
+  }) as never;
+  register(on, {});
+  const order: string[] = [];
+  const timers: { ms: number; fn: () => void }[] = [];
+  let compactCalls = 0;
+  const $ = {
+    session: {
+      usage: vi.fn(async () => ({ context: { percent: usagePercent } })),
+      compact: vi.fn(async () => {
+        order.push('compact');
+        return compactImpl(compactCalls++);
+      }),
+    },
+    clock: {
+      after: vi.fn((ms: number, fn: () => void) => {
+        timers.push({ ms, fn });
+        return { cancel() {} };
+      }),
+    },
+    ui: { log: vi.fn(), toast: vi.fn() },
+    http: { fetch: vi.fn() },
+  };
+  /** Fires the recorded timers (and any they schedule) in order, letting async work settle. */
+  const flush = async (): Promise<void> => {
+    while (timers.length > 0) {
+      timers.shift()!.fn();
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    }
+  };
+  return { hooks, $, order, timers, flush };
+}
+
+describe('turn.complete auto-compact', () => {
+  it('skips subagent turns entirely', async () => {
+    const { hooks, $, timers, flush } = setup();
+    const next = vi.fn(async () => 'r');
+    const out = await hooks.get('turn.complete')!($, { agentId: 'sub-1' }, next);
+    await flush();
+    expect(out).toBe('r');
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(timers).toHaveLength(0);
+    expect($.clock.after).not.toHaveBeenCalled();
+    expect($.session.usage).not.toHaveBeenCalled();
+    expect($.session.compact).not.toHaveBeenCalled();
+  });
+
+  it('calls next first and compacts asynchronously after the hook returns', async () => {
+    const { hooks, $, order, flush } = setup();
+    const next = vi.fn(async () => {
+      order.push('next');
+      return 'r';
+    });
+    const out = await hooks.get('turn.complete')!($, {}, next);
+    expect(out).toBe('r');
+    expect($.clock.after).toHaveBeenCalledWith(250, expect.any(Function));
+    expect($.session.compact).not.toHaveBeenCalled();
+    await flush();
+    expect($.session.compact).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['next', 'compact']);
+  });
+
+  it('does not double-schedule across two turn.complete events', async () => {
+    const { hooks, $, flush } = setup();
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    expect($.clock.after).toHaveBeenCalledTimes(1);
+    await flush();
+    expect($.session.compact).toHaveBeenCalledTimes(1);
+    // after it finishes a later turn may schedule again
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    expect($.clock.after).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries quietly while the turn is still running, then succeeds', async () => {
+    const { hooks, $, timers, flush } = setup(90, async (n) => {
+      if (n === 0) throw new Error('metzger: $.session.compact: a turn is running (t1)');
+    });
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    await flush();
+    expect($.session.compact).toHaveBeenCalledTimes(2);
+    expect($.clock.after).toHaveBeenLastCalledWith(1000, expect.any(Function));
+    expect($.ui.log).not.toHaveBeenCalled();
+    expect(timers).toHaveLength(0);
+  });
+
+  it('gives up silently after 3 retries', async () => {
+    const { hooks, $, flush } = setup(90, async () => {
+      throw new Error('a turn is in flight');
+    });
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    await flush();
+    expect($.session.compact).toHaveBeenCalledTimes(4);
+    expect($.ui.log).not.toHaveBeenCalled();
+    // and can schedule again on a later turn
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    expect($.clock.after).toHaveBeenCalledTimes(5);
+  });
+
+  it('logs other errors without retrying', async () => {
+    const { hooks, $, flush } = setup(90, async () => {
+      throw new Error('boom');
+    });
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    await flush();
+    expect($.session.compact).toHaveBeenCalledTimes(1);
+    expect($.ui.log).toHaveBeenCalledWith('auto-compact skipped (boom)');
+  });
+
+  it('does not compact below the threshold', async () => {
+    const { hooks, $, flush } = setup(10);
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    await flush();
+    expect($.session.compact).not.toHaveBeenCalled();
+  });
+});
+
+describe('session.compact', () => {
+  it('passes subagent and fork compactions through untouched', async () => {
+    const { hooks, $ } = setup();
+    const next = vi.fn(async () => 'core');
+    const event = { agentId: 'sub-1', messages: transcript() };
+    const out = await hooks.get('session.compact')!($, event, next);
+    expect(out).toBe('core');
+    expect(next).toHaveBeenCalledWith(event);
+    expect($.http.fetch).not.toHaveBeenCalled();
+    expect($.ui.log).not.toHaveBeenCalled();
+  });
+});
+
+describe('systemone request size cap', () => {
+  it('throws a clear error instead of sending an oversized body', async () => {
+    const fetchFn = vi.fn(async () => ({ status: 200, ok: true, text: '{}' }));
+    const asker = jevAsker(fetchFn, 'local', 'kaineone/metzger:0.8b');
+    const huge = 'x'.repeat(SYSTEMONE_MAX_BODY_BYTES + 10);
+    await expect(
+      asker.ask(huge, { q: { type: 'noul', instructions: 'Keep?' } }),
+    ).rejects.toThrow(/request too large for local endpoint \(\d+ bytes > \d+ limit\)/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
+describe('systemone budgets', () => {
+  it('keep every request body under the endpoint limit on a large non-ASCII transcript', async () => {
+    const messages: SessionMessage[] = [message('user', 'Refactor the é漢字 module.', { handle: 'h-0' })];
+    for (let i = 0; i < 150; i++) {
+      const blob = { rows: Array.from({ length: 40 }, (_, k) => ({ k, name: `é漢字-${i}-${k}`, ok: k % 2 === 0 })) };
+      const text = `${JSON.stringify(blob)} ${'é漢字'.repeat(600)}`;
+      messages.push(call(`c${i}`, 'Bash', { command: `echo ${'é漢字'.repeat(40)}`, payload: blob }, text));
+      messages.push(result(`c${i}`, text));
+      messages.push(message('assistant', `step ${i} ${'é漢字'.repeat(100)}`, { handle: `a-${i}` }));
+    }
+    const sizes: number[] = [];
+    const config = resolveHookConfig({
+      preserveRecentMessages: 4,
+      maxStateTokens: SYSTEMONE_MAX_STATE_TOKENS,
+      maxRequestTokens: SYSTEMONE_MAX_REQUEST_TOKENS,
+    });
+    await compactSession(messages, config, async (_url, init) => {
+      sizes.push(new TextEncoder().encode(init?.body ?? '').length);
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+      const answers = Object.fromEntries(
+        Object.keys(questions).map((key) => [key, { type: 'noul', noul: 0.5 }]),
+      );
+      return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    });
+    console.log(`systemone max body bytes: ${Math.max(...sizes)} over ${sizes.length} request(s)`);
+    expect(sizes.length).toBeGreaterThan(0);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(SYSTEMONE_MAX_BODY_BYTES);
   });
 });

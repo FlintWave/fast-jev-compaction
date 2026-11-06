@@ -92,11 +92,23 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
+/** The local `/v1/systemone` endpoint rejects bodies (text + schema) over 64 KiB; stay under with margin. */
+export const SYSTEMONE_MAX_BODY_BYTES = 60 * 1024;
+/** Conservative token budgets for the systemone backend so a request fits in SYSTEMONE_MAX_BODY_BYTES. */
+export const SYSTEMONE_MAX_REQUEST_TOKENS = 18_000;
+export const SYSTEMONE_MAX_STATE_TOKENS = 15_000;
+
 /** A `JevAsker` over the engine's `$.http.fetch`. */
 export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string, baseUrl?: string): JevAsker {
   return {
     async ask(state, questions) {
       const request = buildJevRequest({ apiKey, model, baseUrl }, state, questions);
+      const bytes = new TextEncoder().encode(request.body).length;
+      if (bytes > SYSTEMONE_MAX_BODY_BYTES) {
+        throw new Error(
+          `request too large for local endpoint (${bytes} bytes > ${SYSTEMONE_MAX_BODY_BYTES} limit)`,
+        );
+      }
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
@@ -316,9 +328,14 @@ async function checkOllamaModel(
   }
 }
 
+const COMPACT_DELAY_MS = 250;
+const COMPACT_RETRY_MS = 1000;
+const COMPACT_RETRIES = 3;
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+  let scheduled = false;
   let setupChecked = false;
   let modelNumCtx = 0;
 
@@ -361,8 +378,20 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('session.compact', async ($, event, next) => {
+    // A subagent's or fork's own transcript: leave it to core.
+    if (event.agentId) return next(event);
     try {
       const config = { ...configured };
+      if (resolveBackend(config) === 'systemone') {
+        config.maxRequestTokens = Math.min(
+          config.maxRequestTokens ?? 30_000,
+          SYSTEMONE_MAX_REQUEST_TOKENS,
+        );
+        config.maxStateTokens = Math.min(
+          config.maxStateTokens ?? 25_000,
+          SYSTEMONE_MAX_STATE_TOKENS,
+        );
+      }
       if (modelNumCtx > 0) {
         const maxReq = Math.floor(modelNumCtx * 0.9);
         config.maxRequestTokens = Math.min(config.maxRequestTokens ?? 30_000, maxReq);
@@ -395,20 +424,42 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
-    try {
-      const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
-      compacting = true;
-      await $.session.compact();
-    } catch (error) {
-      $.ui.log(
-        `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
-      );
-    } finally {
-      compacting = false;
-    }
-    return next(event);
+    // Subagent turns reach every hook; only the main loop may trigger compaction.
+    if (event.agentId) return next(event);
+    const result = await next(event);
+    if (compacting || scheduled) return result;
+    scheduled = true;
+
+    // $.session.compact rejects while a turn runs, so start it after this hook
+    // returns, and retry a few times if the host has not yet finished the turn.
+    const run = async (attempt: number): Promise<void> => {
+      let retry = false;
+      try {
+        const { context } = await $.session.usage();
+        if ((context.percent ?? 0) < configured.compactAtPercent) return;
+        compacting = true;
+        await $.session.compact();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/turn is running|in flight/.test(message)) {
+          retry = attempt < COMPACT_RETRIES;
+        } else {
+          $.ui.log(`auto-compact skipped (${message})`);
+        }
+      } finally {
+        compacting = false;
+        if (!retry) scheduled = false;
+      }
+      if (retry) {
+        $.clock.after(COMPACT_RETRY_MS, () => {
+          void run(attempt + 1);
+        });
+      }
+    };
+    $.clock.after(COMPACT_DELAY_MS, () => {
+      void run(0);
+    });
+    return result;
   });
 };
 
