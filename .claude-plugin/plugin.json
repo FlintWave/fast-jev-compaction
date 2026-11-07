@@ -1,6 +1,6 @@
 {
   "name": "metzger",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "author": { "name": "FlintWave Inc." },
   "description": "Context compaction for Claude Code — a small local model scores each message and cuts what's dead.",
   "license": "MIT",

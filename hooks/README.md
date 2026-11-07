@@ -32,7 +32,7 @@ See the root README for the full list.
 
 | Option | Default |
 | --- | ---: |
-| `model` | `metzger:0.8b` |
+| `model` | `kaineone/metzger:0.8b` |
 | `keepThreshold` | `0.5` |
 | `preserveRecentMessages` | `6` |
 | `compactAtPercent` | `60` |

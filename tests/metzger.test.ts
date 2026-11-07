@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { afterEach, vi } from 'vitest';
 import {
   applyDecisions,
+  compactMessages,
+  createJevAsker,
+  resolveBackend,
   batchCalls,
   buildJevRequest,
   collectToolCalls,
@@ -9,6 +13,7 @@ import {
   estimateTokens,
   fitState,
   parseJevResponse,
+  questionsFor,
   reductionRatio,
   resolveOptions,
   type HistoryToolCall,
@@ -251,6 +256,14 @@ describe('question batching', () => {
   it('throws when a single question does not fit', () => {
     expect(() => batchCalls(calls, 29_990, options)).toThrow(/no room/);
   });
+
+  it('never puts more than 64 questions (32 calls) in one request', () => {
+    const many: ToolCall[] = Array.from({ length: 70 }, (_, i) => ({ ...calls[0]!, id: `t${i + 1}`, tool_use_id: `tool-${i + 1}` }));
+    const batches = batchCalls(many, 1000, options);
+    expect(batches.map((b) => b.length)).toEqual([32, 32, 6]);
+    expect(batches.every((b) => Object.keys(Object.assign({}, ...b.map(questionsFor))).length <= 64)).toBe(true);
+    expect(batches.flat().map((c) => c.id)).toEqual(many.map((c) => c.id));
+  });
 });
 
 describe('decisions', () => {
@@ -407,5 +420,56 @@ describe('HTTP request building', () => {
     expect(() => parseJevResponse(200, true, 'not json')).toThrow(/malformed/);
     expect(() => parseJevResponse(200, true, '{}')).toThrow(/missing answers/);
     expect(parseJevResponse(200, true, '{"answers":{}}')).toEqual({ answers: {} });
+  });
+});
+
+describe('backend selection', () => {
+  it('follows the model name unless forced', () => {
+    expect(resolveBackend('kaineone/metzger:0.8b')).toBe('systemone');
+    expect(resolveBackend('kaineone/metzger')).toBe('systemone');
+    expect(resolveBackend('kaineone/metzger:distill-0.8b')).toBe('chat');
+    expect(resolveBackend('kaineone/metzger:0.8b', 'chat')).toBe('chat');
+    expect(resolveBackend('tev1-distill:0.8b', 'systemone')).toBe('systemone');
+  });
+
+  it('builds the decision-protocol asker for the default model and the chat asker for a distill', async () => {
+    const urls: string[] = [];
+    const fetchFn = async (url: string, init?: { body?: string }) => {
+      urls.push(url);
+      if (url.endsWith('/api/chat')) {
+        return { status: 200, ok: true, text: JSON.stringify({ message: { content: 'A' } }) };
+      }
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+      const answers = Object.fromEntries(Object.keys(questions).map((k) => [k, { noul: 1 }]));
+      return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    };
+    const q = { q: { type: 'noul' as const, instructions: 'Keep?' } };
+    await createJevAsker({}, fetchFn).ask('s', q);
+    await createJevAsker({ model: 'kaineone/metzger:distill-0.8b' }, fetchFn).ask('s', q);
+    await createJevAsker({ model: 'kaineone/metzger:distill-0.8b', baseUrl: 'http://box:11434/v1/systemone/' }, fetchFn).ask('s', q);
+    expect(urls).toEqual([
+      'http://localhost:11434/v1/systemone',
+      'http://localhost:11434/api/chat',
+      'http://box:11434/api/chat',
+    ]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('compactMessages talks the decision protocol to the default model over globalThis.fetch', async () => {
+    const calls: { url: string; body: string }[] = [];
+    vi.stubGlobal('fetch', async (url: string, init?: { body?: string }) => {
+      calls.push({ url, body: init?.body ?? '' });
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+      const answers = Object.fromEntries(Object.keys(questions).map((k) => [k, { type: 'noul', noul: 0.1 }]));
+      return { status: 200, ok: true, text: async () => JSON.stringify({ answers }) };
+    });
+    const output = await compactMessages(transcript(), { preserveRecentMessages: 1 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe('http://localhost:11434/v1/systemone');
+    expect(JSON.parse(calls[0]!.body).model).toBe('kaineone/metzger:0.8b');
+    expect(output.decisions.every((d) => d.action === 'drop_call')).toBe(true);
   });
 });

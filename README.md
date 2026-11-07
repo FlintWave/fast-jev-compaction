@@ -134,6 +134,13 @@ removed.
 
 If the conversation is long, the scoring is split across multiple requests
 (same full context, different batches of questions) that run concurrently.
+The chat-API backend asks one question per request and keeps only a couple in
+flight, so queued requests never pile up behind Ollama's own parallelism.
+
+Text typed after `/compact` (for example `/compact keep the migration plan`)
+becomes the goal the scorer keeps in mind. Claude Code's ahead-of-time
+"precompute" compactions are left to the built-in summarizer; Metzger decides
+at the real compaction, when the transcript is final.
 
 ## Options
 
@@ -141,7 +148,7 @@ Set these in `~/.claude/settings.json` under `pluginConfigs.metzger`:
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `model` | `metzger:0.8b` | Which scoring model to use |
+| `model` | `kaineone/metzger:0.8b` | Which scoring model to use |
 | `keepThreshold` | `0.5` | Probability cutoff. Lower keeps more, higher cuts more aggressively |
 | `preserveRecentMessages` | `6` | Most recent messages that are never touched |
 | `compactAtPercent` | `60` | Context fill % that triggers automatic compaction |
@@ -172,6 +179,11 @@ const result = await compactMessages(transcript, { preserveRecentMessages: 4 });
 console.log(result.messages, result.decisions, result.stats);
 ```
 
+`compactMessages` talks to a local Ollama over `fetch`. The backend follows the
+model name, as in the plugin: the decision protocol at `baseUrl` for the
+Metzger models, the chat API for the `distill` variants; pass `backend` to
+force either.
+
 `Message` is a subset of Claude Code's `SessionMessage`, so a session transcript
 can be passed in directly.
 
@@ -190,7 +202,7 @@ can be passed in directly.
 ```sh
 npm install
 npm run typecheck
-npm test                  # 34 tests, all offline, no model needed
+npm test                  # all offline, no model needed
 npm run build
 npm run validate:plugin
 npm run demo              # live test against local Ollama

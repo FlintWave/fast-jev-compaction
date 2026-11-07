@@ -8,8 +8,9 @@
     {
       "name": "metzger",
       "source": "./",
-      "description": "Context compaction for Claude Code — a small local model scores each message and cuts what's dead.",
+      "description": "Context compaction for Claude Code \u2014 a small local model scores each message and cuts what's dead.",
       "license": "MIT"
     }
-  ]
+  ],
+  "description": "Metzger: context compaction for Claude Code that keeps messages verbatim and cuts only the tool output a local model scores as stale."
 }
