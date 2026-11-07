@@ -129,7 +129,7 @@ describe('compactSession', () => {
     expect(JSON.parse(bodies[0]!).model).toBe('kaineone/metzger:0.8b');
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
     expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
-    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
+    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 calls dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
     expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=0.90/result=0.90');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });
@@ -251,8 +251,13 @@ function setup(
   },
 ) {
   const hooks = new Map<string, AnyHook>();
-  const on = ((pattern: string, hook: AnyHook) => {
-    hooks.set(pattern, hook);
+  const matchers = new Map<string, Record<string, unknown>>();
+  const on = ((pattern: string, matcherOrHook: AnyHook | Record<string, unknown>, maybeHook?: AnyHook) => {
+    if (typeof matcherOrHook === 'function') hooks.set(pattern, matcherOrHook);
+    else {
+      matchers.set(pattern, matcherOrHook);
+      hooks.set(pattern, maybeHook!);
+    }
     return { dispose() {} };
   }) as never;
   register(on, options);
@@ -283,7 +288,7 @@ function setup(
       for (let i = 0; i < 10; i++) await Promise.resolve();
     }
   };
-  return { hooks, $, order, timers, flush };
+  return { hooks, matchers, $, order, timers, flush };
 }
 
 describe('turn.complete auto-compact', () => {
@@ -440,6 +445,7 @@ function ollama(models: string[], probe: FakeResponse | (() => FakeResponse)) {
 
 const runStatus = async (h: ReturnType<typeof setup>): Promise<string> => {
   await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+  await h.flush();
   const out = await h.hooks.get('command.run')!(h.$, { command: 'metzger:status', args: '' }, async () => ({ text: 'file command' }));
   return out.text as string;
 };
@@ -450,10 +456,12 @@ describe('status command', () => {
       throw new Error('offline');
     });
     await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    await h.flush();
     const next = vi.fn(async () => ({ text: 'file command' }));
     const out = await h.hooks.get('command.run')!(h.$, { command: 'metzger:status', args: '' }, next);
     expect(next).not.toHaveBeenCalled();
-    expect(out.text).toContain('metzger 0.6.0');
+    expect(out.text).toContain('metzger 0.6.1');
+    expect(h.matchers.get('command.run')).toEqual({ command: 'metzger:status' });
   });
 
   it('passes other commands (including a bare status) through to next', async () => {
@@ -497,7 +505,13 @@ describe('status command', () => {
 describe('model names', () => {
   it('uses kaineone/metzger:0.8b when only that is pulled and the legacy name is configured', async () => {
     const h = setup(90, undefined, { model: 'metzger:0.8b' }, ollama(['kaineone/metzger:0.8b'], ok('{}')));
-    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    const next = vi.fn(async () => 'r');
+    await h.hooks.get('session.start')!(h.$, {}, next);
+    // The check runs from a timer so the session's start is never held up.
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(h.$.http.fetch).not.toHaveBeenCalled();
+    expect(h.$.ui.toast).not.toHaveBeenCalled();
+    await h.flush();
     expect(h.$.ui.toast).toHaveBeenCalledTimes(1);
     expect(h.$.ui.toast.mock.calls[0]![0]).toBe('metzger: using kaineone/metzger:0.8b; update the model option');
   });
@@ -505,6 +519,7 @@ describe('model names', () => {
   it('prints the pull command with a single prefix when the model is missing', async () => {
     const h = setup(90, undefined, {}, ollama([], ok('{}')));
     await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    await h.flush();
     const text = h.$.ui.toast.mock.calls[0]![0] as string;
     expect(text).toContain('ollama pull kaineone/metzger:0.8b');
     expect(text).not.toContain('kaineone/kaineone');
@@ -521,5 +536,129 @@ describe('session.compact failures', () => {
     expect(out).toBe('core');
     const text = h.$.ui.toast.mock.calls[0]![0] as string;
     expect(text).toMatch(/fallback to built-in summary \(request to http:\/\/localhost:11434\/v1\/systemone failed: ECONNRESET\)/);
+  });
+});
+
+describe('session.compact triggers', () => {
+  it('leaves a precompute to core without calling the model or toasting', async () => {
+    const h = setup(90, undefined, { preserveRecentMessages: 1 }, jevFetch(() => 0.1));
+    const next = vi.fn(async () => 'core');
+    const event = { trigger: 'precompute', messages: transcript() };
+    const out = await h.hooks.get('session.compact')!(h.$, event, next);
+    expect(out).toBe('core');
+    expect(next).toHaveBeenCalledWith(event);
+    expect(h.$.http.fetch).not.toHaveBeenCalled();
+    expect(h.$.ui.toast).not.toHaveBeenCalled();
+    const status = await runStatus({ ...h, $: { ...h.$, http: { fetch: vi.fn(async () => { throw new Error('offline'); }) } } } as never);
+    expect(status).toContain('last compaction: none yet this session');
+  });
+
+  it('uses the text typed after /compact as the scoring goal', async () => {
+    const bodies: string[] = [];
+    const h = setup(90, undefined, { preserveRecentMessages: 1 }, jevFetch(() => 0.1, bodies));
+    const out = await h.hooks.get('session.compact')!(
+      h.$,
+      { trigger: 'manual', instructions: 'keep the migration plan', messages: transcript() },
+      async () => 'core',
+    );
+    expect(out).toHaveProperty('messages');
+    expect(bodies).toHaveLength(1);
+    expect(JSON.parse(bodies[0]!).state.goal).toBe('keep the migration plan');
+  });
+
+  it('records a vetoed auto-compaction', async () => {
+    const h = setup(90, async () => ({ skip: 'a hook said no' }));
+    await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+    await h.flush();
+    const status = await runStatus({ ...h, $: { ...h.$, http: { fetch: vi.fn(async () => { throw new Error('offline'); }) } } } as never);
+    expect(status).toContain('auto-compact skipped by a hook (a hook said no)');
+  });
+
+  it('retries whatever wording the host uses for a running turn', async () => {
+    const h = setup(90, async (n) => {
+      if (n === 0) throw new Error('cannot compact: the session is not idle');
+    });
+    await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+    await h.flush();
+    expect(h.$.session.compact).toHaveBeenCalledTimes(2);
+  });
+
+  it('schedules again once a lost schedule has gone stale', async () => {
+    const h = setup(90);
+    const realNow = Date.now;
+    try {
+      let now = 1_000_000;
+      Date.now = () => now;
+      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+      // The timer dispatch was refused: nothing ever fires, nothing resets the flag.
+      h.timers.length = 0;
+      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+      expect(h.$.clock.after).toHaveBeenCalledTimes(1);
+      now += 6 * 60_000;
+      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+      expect(h.$.clock.after).toHaveBeenCalledTimes(2);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+});
+
+describe('chat answer parsing', () => {
+  const chatAsker = (reply: (trueLabel: string, falseLabel: string) => string, seen: string[] = []) =>
+    new ChatJevAsker({
+      baseUrl: 'http://localhost:11434',
+      model: 'kaineone/metzger:distill-0.8b',
+      fetch: async (_url, init) => {
+        const body = JSON.parse(init?.body ?? '{}');
+        const payload = JSON.parse(body.messages[1].content);
+        const t = payload.options.find((o: { key: string }) => o.key === 'true').label;
+        const f = payload.options.find((o: { key: string }) => o.key === 'false').label;
+        seen.push(payload.question.text);
+        return { status: 200, ok: true, text: JSON.stringify({ message: { content: reply(t, f) } }) };
+      },
+    });
+  const q = { q: { type: 'noul' as const, instructions: 'Keep?' } };
+
+  it('reads the letter through punctuation, whitespace and a think block', async () => {
+    expect((await chatAsker((t) => `${t}.\n`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 1 });
+    expect((await chatAsker((_t, f) => ` ${f}`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 0 });
+    expect((await chatAsker((_t, f) => `<think>B or A?</think>\n${f}`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 0 });
+  });
+
+  it('keeps the item when the reply names no option', async () => {
+    expect((await chatAsker(() => 'I cannot decide').ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 1 });
+    expect((await chatAsker(() => '').ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 1 });
+  });
+
+  it('rejects a reply with no message content', async () => {
+    const asker = new ChatJevAsker({
+      baseUrl: 'http://localhost:11434',
+      model: 'kaineone/metzger:distill-0.8b',
+      fetch: async () => ({ status: 200, ok: true, text: '{"message":{}}' }),
+    });
+    await expect(asker.ask('s', q)).rejects.toThrow(/no message content/);
+  });
+
+  it('keeps at most `concurrency` chat requests in flight', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const asker = new ChatJevAsker({
+      baseUrl: 'http://localhost:11434',
+      model: 'kaineone/metzger:distill-0.8b',
+      concurrency: 3,
+      fetch: async () => {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        inFlight -= 1;
+        return { status: 200, ok: true, text: JSON.stringify({ message: { content: 'A' } }) };
+      },
+    });
+    const questions = Object.fromEntries(
+      Array.from({ length: 12 }, (_, i) => [`q${i}`, { type: 'noul' as const, instructions: `Keep ${i}?` }]),
+    );
+    const { answers } = await asker.ask('s', questions);
+    expect(Object.keys(answers)).toHaveLength(12);
+    expect(peak).toBe(3);
   });
 });
