@@ -13,6 +13,7 @@ import {
   estimateTokens,
   fitState,
   parseJevResponse,
+  questionsFor,
   reductionRatio,
   resolveOptions,
   type HistoryToolCall,
@@ -254,6 +255,14 @@ describe('question batching', () => {
 
   it('throws when a single question does not fit', () => {
     expect(() => batchCalls(calls, 29_990, options)).toThrow(/no room/);
+  });
+
+  it('never puts more than 64 questions (32 calls) in one request', () => {
+    const many: ToolCall[] = Array.from({ length: 70 }, (_, i) => ({ ...calls[0]!, id: `t${i + 1}`, tool_use_id: `tool-${i + 1}` }));
+    const batches = batchCalls(many, 1000, options);
+    expect(batches.map((b) => b.length)).toEqual([32, 32, 6]);
+    expect(batches.every((b) => Object.keys(Object.assign({}, ...b.map(questionsFor))).length <= 64)).toBe(true);
+    expect(batches.flat().map((c) => c.id)).toEqual(many.map((c) => c.id));
   });
 });
 
